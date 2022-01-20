@@ -36,10 +36,12 @@ const(
 type Task struct {
 	TaskType TaskType
 	TaskId int
+	//reduce的数量
 	NreduceNum int
 	NmapNum int
 	InputFile string
 	WorkerId int
+	//需要检测，当超时的时候重新分配这个任务
 	DDL time.Time
 }
 
@@ -144,6 +146,7 @@ func CallMapTask(reply *WorkerReply,mapf func(string, string) []KeyValue){
 
 }
 func CallReduceTask(reply *WorkerReply,reducef func(string, []string) string){
+	//由于在maptask的时候每个任务都会生成数量为nReducenum的文件，因此Reduce任务需要计算所有的mr-TaskId-i(i表示当前的ReduceID）
 	fileNames := AskFile(reply)
 	var intermediate []KeyValue
 	var lines []string
