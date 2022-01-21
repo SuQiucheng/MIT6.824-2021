@@ -440,6 +440,7 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 
 		cfg.mu.Lock()
 		cmd1, ok := cfg.logs[i][index]
+		//DPrintf("Node %d's log is %v,the %d is %v",i,cfg.logs[i],index,cfg.logs[i][index])
 		cfg.mu.Unlock()
 
 		if ok {
@@ -511,9 +512,11 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				rf = cfg.rafts[starts]
 			}
 			cfg.mu.Unlock()
+			//DPrintf("正在找leader...")
 			if rf != nil {
 				index1, _, ok := rf.Start(cmd)
 				if ok {
+					//DPrintf("%d is the leader! the cmd index is %d",si,index1)
 					index = index1
 					break
 				}
@@ -526,6 +529,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				//DPrintf("nd：%d,cmd1:%v",nd,cmd1)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {

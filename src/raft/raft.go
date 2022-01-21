@@ -47,6 +47,7 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	applyCh chan ApplyMsg
+	applyCond *sync.Cond
 	state NodeState
 
 	currentTerm int
@@ -81,6 +82,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm int
 
 	// For 2D:
 	SnapshotValid bool
@@ -252,12 +254,12 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
-	DPrintf("%d %dis called by %d %d",rf.me,rf.currentTerm,args.CandidateId,args.Term)
+	//DPrintf("%d %dis called by %d %d",rf.me,rf.currentTerm,args.CandidateId,args.Term)
 	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		DPrintf("%d没有投票给%d",rf.me,args.CandidateId)
+		//DPrintf("%d没有投票给%d",rf.me,args.CandidateId)
 		return
 	}
 	//DPrintf("当前rf状态为：%v",rf)
@@ -269,14 +271,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.LastLogTerm<rf.GetLastLog().Term ||(args.LastLogTerm==rf.GetLastLog().Term&&args.LastLogIndex<rf.GetLastLog().Index){
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		DPrintf("%d没有投票给%d",rf.me,args.CandidateId)
+		//DPrintf("%d没有投票给%d",rf.me,args.CandidateId)
 
 		return
 	}
 	rf.votedFor = args.CandidateId
 	rf.electionTimer.Reset(RandomElectionTimeout())
 	reply.Term, reply.VoteGranted = rf.currentTerm, true
-	DPrintf("%d投票给%d",rf.me,args.CandidateId)
+	//DPrintf("%d投票给%d",rf.me,args.CandidateId)
 
 }
 
@@ -337,23 +339,28 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := false
 
 	// Your code here (2B).
 	if term,isLeader = rf.GetState();isLeader{
 		rf.mu.Lock()
-		term,index = rf.lastLogTermIndex()
+		defer rf.mu.Unlock()
+		index = rf.GetLastLog().Index
+		//_,index = rf.lastLogTermIndex()
+		term = rf.currentTerm
 		entry := Entry{
 			Command: command,
 			Term:    term,
-			Index:   index,
+			Index:   index+1,
 		}
 		rf.logs = append(rf.logs,entry)
-		rf.matchIndex[rf.me] = index
-		rf.nextIndex[rf.me] = index+1
-		rf.mu.Unlock()
+		rf.matchIndex[rf.me] = entry.Index
+		rf.nextIndex[rf.me] = entry.Index+1
+		//DPrintf("the log has appended the %d's log entries!",rf.me)
+	//	ToDo 现在就开启一个心跳，还是直接发送给follower
+		rf.BroadcastHeartBeat(Replicator)
 	}
-	return index, term, isLeader
+	return index+1, term, isLeader
 }
 
 func (rf *Raft) lastLogTermIndex()(int,int)  {
@@ -394,7 +401,7 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 		select {
 		case <-rf.electionTimer.C:
-			DPrintf("%d 's electionTimer is dired!",rf.me)
+			//DPrintf("%d 's electionTimer is dired!",rf.me)
 			rf.mu.Lock()
 			rf.ChangeState(candidate)
 			rf.currentTerm += 1
@@ -428,8 +435,8 @@ func (rf *Raft) AppendEntries(request *AppendEntriesRequest, response *AppendEnt
 	//log.Printf("follower:%d接收到心跳，重置选举时间", os.Getpid())
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("follower:%d接收到心跳，重置选举时间", rf.me)
-
+	//DPrintf("follower:%d接收到心跳，重置选举时间", rf.me)
+	//DPrintf("follower:%d接收到心跳，日志为：%v", rf.me,request)
 	if request.Term<rf.currentTerm {
 		response.Term = rf.currentTerm
 		response.Success = false
@@ -439,7 +446,10 @@ func (rf *Raft) AppendEntries(request *AppendEntriesRequest, response *AppendEnt
 		rf.currentTerm = request.Term
 	}
 	rf.ChangeState(follower)
-	lastLogIndex := len(rf.logs)-1
+	rf.electionTimer.Reset(RandomElectionTimeout())
+
+	_,lastLogIndex := rf.lastLogTermIndex()
+	//DPrintf("follower %d's lastLogIndex is %d",rf.me,lastLogIndex)
 	if lastLogIndex<request.PrevLogIndex{
 		response.Term = rf.currentTerm
 		response.Success = false
@@ -451,9 +461,13 @@ func (rf *Raft) AppendEntries(request *AppendEntriesRequest, response *AppendEnt
 		response.Success = false
 		return
 	}
+	//DPrintf("follower %d start log replicate",rf.me)
 	//是不是需要找到unMatchIndex
 	rf.logs = rf.logs[:request.PrevLogIndex+1]
 	rf.logs = append(rf.logs,request.Entries...)
+	//DPrintf("follower %d finish log replicate,the entries is %v",rf.me,rf.logs)
+	rf.applyCond.Signal()
+
 	if request.LeaderCommit>rf.commitIndex{
 		rf.commitIndex = int(math.Min(float64(len(rf.logs)-1), float64(request.LeaderCommit)))
 	}
@@ -462,19 +476,18 @@ func (rf *Raft) AppendEntries(request *AppendEntriesRequest, response *AppendEnt
 	return
 }
 
+//可以加速复制，也可以不用多线程的方法复制-------from learnAi
 func (rf *Raft) BroadcastHeartBeat(t AppendEntriesType) {
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		} else {
-			if t == HeartBeat {
-				go rf.replicateOneRound(peer)
-			}else {
-
-			}
+			//DPrintf("%d 开始日志的复制！",rf.me)
+			go rf.replicateOneRound(peer)
 		}
 	}
 }
+
 func (rf *Raft) replicateOneRound(peer int){
 	rf.mu.Lock()
 	if rf.state != leader {
@@ -486,7 +499,7 @@ func (rf *Raft) replicateOneRound(peer int){
 	response := &AppendEntriesResponse{}
 	if rf.sendAppendEntries(peer,request,response){
 		rf.mu.Lock()
-		//ToDo process response
+		//DPrintf("%d has the response:%v",rf.me,response)
 		rf.handleAppendEntriesResponse(peer,request,response)
 		rf.mu.Unlock()
 	}
@@ -499,7 +512,8 @@ func (rf *Raft) handleAppendEntriesResponse(peer int, request *AppendEntriesRequ
 			majorityIndex := rf.getMajorityIndex(rf.matchIndex)
 			if majorityIndex > rf.commitIndex {
 				rf.commitIndex = majorityIndex
-				//Todo 在这里可以应用
+				//DPrintf("leader %d's commitIndex is %d",rf.me,rf.commitIndex)
+				rf.applyCond.Signal()
 			}
 		} else {
 			if response.Term > rf.currentTerm {
@@ -541,7 +555,7 @@ func (rf *Raft) GenAppendEntriesRequest(peer int) *AppendEntriesRequest {
 }
 
 func (rf *Raft) StartElection() {
-	DPrintf("%d开始选举",rf.me)
+	//DPrintf("%d开始选举",rf.me)
 	request := rf.genRequestVoteArgs()
 	//统计选票有多少
 	votesNum := 1
@@ -589,29 +603,58 @@ func (rf *Raft) ChangeState(state NodeState) {
 	if rf.state == state {
 		return
 	}
-	DPrintf("{Node %d} changes state from %s to %s in term %d", rf.me, rf.state, state, rf.currentTerm)
+	//DPrintf("{Node %d} changes state from %s to %s in term %d", rf.me, rf.state, state, rf.currentTerm)
 	rf.state = state
 	switch state {
 	case follower:
 		//rf.votedFor = -1
 		rf.heartbeatTimer.Stop()
 		rf.electionTimer.Reset(RandomElectionTimeout())
-		DPrintf("%d的选举时间被重置了！",rf.me)
+		//DPrintf("%d的选举时间被重置了！",rf.me)
 	case candidate:
 	case leader:
-		lastLog := rf.GetLastLog()
+		//lastLog := rf.GetLastLog()
 		//初始化nextIndex,matchIndex
 		rf.nextIndex = make([]int,len(rf.peers))
 		rf.matchIndex = make([]int,len(rf.peers))
 		for i,length:=0,len(rf.peers);i<length;i++{
-			rf.nextIndex[i] = lastLog.Index+1
+			//rf.nextIndex[i] = lastLog.Index+1
+			rf.nextIndex[i] = len(rf.logs)
 			rf.matchIndex[i] = 0
 		}
 		rf.electionTimer.Stop()
 		rf.heartbeatTimer.Reset(StableHeartbeatTimeout())
 	}
 }
+func (rf *Raft) applier() {
+	for rf.killed()==false{
+		rf.mu.Lock()
+		for rf.lastApplied>=rf.commitIndex{
+			rf.applyCond.Wait()
+		}
+		commitIndex,lastApplied := rf.commitIndex,rf.lastApplied
+		entries := make([]Entry,commitIndex-lastApplied)
+		copy(entries,rf.logs[lastApplied+1:commitIndex+1])
+		rf.mu.Unlock()
+		for _,entry := range entries{
+			rf.applyCh <- ApplyMsg{
+				CommandValid:  true,
+				Command:       entry.Command,
+				CommandIndex:  entry.Index,
+				CommandTerm: entry.Term,
+				SnapshotValid: false,
+				Snapshot:      nil,
+				SnapshotTerm:  0,
+				SnapshotIndex: 0,
+			}
+		}
+		rf.mu.Lock()
+		rf.lastApplied = int(math.Max(float64(rf.lastApplied),float64(commitIndex)))
+		rf.mu.Unlock()
+		//DPrintf("Node %d's entry is applying！",rf.me)
+	}
 
+}
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -643,16 +686,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		commitIndex: 0,
 		lastApplied: 0,
 	}
+	rf.applyCond  = sync.NewCond(&rf.mu)
 	// Your initialization code here (2A, 2B, 2C).
 	rf.heartbeatTimer.Stop()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	// start ticker goroutine to start elections
-	lastLog := rf.GetLastLog()
+	//lastLog := rf.GetLastLog()
 	for i:=0;i<len(peers);i++{
-		rf.matchIndex[i],rf.nextIndex[i] = 0,lastLog.Index+1
+		rf.matchIndex[i],rf.nextIndex[i] = 0,len(rf.logs)
 	}
 	go rf.ticker()
-
+	go rf.applier()
 	return rf
 }
