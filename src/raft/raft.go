@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"fmt"
 	"math"
 	"sort"
@@ -158,12 +160,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -175,17 +178,20 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logs []Entry
+	if d.Decode(&currentTerm) != nil ||
+	   d.Decode(&votedFor) != nil ||
+		d.Decode(&logs)!=nil{
+	  DPrintf("读取持久化错误")
+	} else {
+	  rf.currentTerm = currentTerm
+	  rf.votedFor = votedFor
+	  rf.logs = logs
+	}
 }
 
 //
@@ -278,6 +284,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.votedFor = args.CandidateId
 	rf.electionTimer.Reset(RandomElectionTimeout())
 	reply.Term, reply.VoteGranted = rf.currentTerm, true
+
+	rf.persist()
 	//DPrintf("%d投票给%d",rf.me,args.CandidateId)
 
 }
@@ -356,9 +364,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.logs = append(rf.logs,entry)
 		rf.matchIndex[rf.me] = entry.Index
 		rf.nextIndex[rf.me] = entry.Index+1
+
 		//DPrintf("the log has appended the %d's log entries!",rf.me)
 	//	ToDo 现在就开启一个心跳，还是直接发送给follower
 		rf.BroadcastHeartBeat(Replicator)
+		rf.persist()
 	}
 	return index+1, term, isLeader
 }
@@ -408,6 +418,7 @@ func (rf *Raft) ticker() {
 			//进行选举
 			rf.StartElection()
 			rf.electionTimer.Reset(RandomElectionTimeout())
+			rf.persist()
 			rf.mu.Unlock()
 		//	如果心跳超时仍然要等待它这个term过完吗
 		case <-rf.heartbeatTimer.C:
@@ -465,6 +476,9 @@ func (rf *Raft) AppendEntries(request *AppendEntriesRequest, response *AppendEnt
 	//是不是需要找到unMatchIndex
 	rf.logs = rf.logs[:request.PrevLogIndex+1]
 	rf.logs = append(rf.logs,request.Entries...)
+
+	rf.persist()
+
 	//DPrintf("follower %d finish log replicate,the entries is %v",rf.me,rf.logs)
 	rf.applyCond.Signal()
 
@@ -509,6 +523,8 @@ func (rf *Raft) handleAppendEntriesResponse(peer int, request *AppendEntriesRequ
 		if response.Success {
 			rf.matchIndex[peer] = request.PrevLogIndex + len(request.Entries)
 			rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+			//DPrintf("Node %d,rf.nextIndex:%v",rf.me,rf.nextIndex)
+
 			majorityIndex := rf.getMajorityIndex(rf.matchIndex)
 			if majorityIndex > rf.commitIndex {
 				rf.commitIndex = majorityIndex
@@ -522,10 +538,11 @@ func (rf *Raft) handleAppendEntriesResponse(peer int, request *AppendEntriesRequ
 			} else {
 				preLogIndex := request.PrevLogIndex
 				//如果这一次请求增加日志没有匹配上的话，就跳过这个term
-				for preLogIndex > 0 && rf.logs[preLogIndex].Term == rf.currentTerm {
+				//ToDo 需要优化，这样子的话有可能一下子要传输的log[]太多了
+				for preLogIndex > 0 && rf.logs[preLogIndex].Term == request.PrevLogTerm {
 					preLogIndex--
 				}
-				rf.nextIndex[peer] = preLogIndex
+				rf.nextIndex[peer] = preLogIndex+1
 			}
 		}
 	}
@@ -586,6 +603,8 @@ func (rf *Raft) StartElection() {
 						//假如有其他当选，或者自己的最后的log没有别人的新，那么就需要将votedFor设置为-1
 						rf.currentTerm = response.Term
 						rf.votedFor = -1
+
+						rf.persist()
 					}
 				}
 			}
@@ -622,6 +641,7 @@ func (rf *Raft) ChangeState(state NodeState) {
 			rf.nextIndex[i] = len(rf.logs)
 			rf.matchIndex[i] = 0
 		}
+		//DPrintf("Node %d,rf.nextIndex:%v",rf.me,rf.nextIndex)
 		rf.electionTimer.Stop()
 		rf.heartbeatTimer.Reset(StableHeartbeatTimeout())
 	}
