@@ -27,8 +27,8 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 const (
-	HeartbeatTimeout = 150
-	ElectionTimeout = 1000
+	HeartbeatTimeout = 50
+	ElectionTimeout = 500
 )
 
 func StableHeartbeatTimeout() time.Duration {
