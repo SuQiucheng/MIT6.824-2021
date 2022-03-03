@@ -8,7 +8,18 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	leaderId int
+	clientId int64
+	commandId int64
+
 }
+type OpType int
+
+const(
+	OpGet OpType = iota
+	OpPut
+	OpAppend
+)
 
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
@@ -21,6 +32,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientId = nrand()
 	return ck
 }
 
@@ -39,7 +51,11 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	request := new(CommandRequest)
+	request.Key = key
+	request.OpType = OpGet
+
+	return ck.Command(request)
 }
 
 //
@@ -54,6 +70,16 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	command := new(CommandRequest)
+	command.Key= key
+	command.Value = value
+	switch op {
+	case "Put":
+		command.OpType = OpPut
+	case "Append":
+		command.OpType = OpAppend
+	}
+	ck.Command(command)
 }
 
 func (ck *Clerk) Put(key string, value string) {
@@ -61,4 +87,20 @@ func (ck *Clerk) Put(key string, value string) {
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+func (ck *Clerk) Command(request *CommandRequest) string{
+	request.ClientId,request.CommandId = ck.clientId,ck.commandId
+	for {
+		response := new(CommandResponse)
+		if !ck.servers[ck.leaderId].Call("KVServer.ClientRequest",request,response)|| response.Err == ErrWrongLeader || response.Err == TimeDesired{
+			//DPrintf("正在找leader:%d",ck.leaderId)
+			//DPrintf("request:%+v,response:%+v",request,response)
+			ck.leaderId = (ck.leaderId+1)%len(ck.servers)
+			continue
+		}
+		DPrintf("leader is %d",ck.leaderId)
+		ck.commandId+=1
+		return response.Value
+
+	}
 }

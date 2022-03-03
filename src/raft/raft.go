@@ -235,7 +235,6 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	}
 	rf.logs[0].Term = lastIncludedTerm
 	rf.logs[0].Index = lastIncludedIndex
-	//DPrintf("%d's CondInstallSnapshot,logs:%v",rf.me,rf.logs)
 
 	rf.commitIndex, rf.lastApplied = lastIncludedIndex, lastIncludedIndex
 
