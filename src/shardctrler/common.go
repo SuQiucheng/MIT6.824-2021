@@ -19,7 +19,7 @@ package shardctrler
 
 // The number of shards.
 const NShards = 10
-
+const ExecuteTimeout = 100
 // A configuration -- an assignment of shards to groups.
 // Please don't change this.
 type Config struct {
@@ -30,12 +30,15 @@ type Config struct {
 
 const (
 	OK = "OK"
+	TimeDesired = "TimeDesired"
 )
 
 type Err string
 
 type JoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
+	ClientId int64
+	CommandId int64
 }
 
 type JoinReply struct {
@@ -70,4 +73,40 @@ type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+}
+type OpType string
+
+const (
+	Query OpType = "Query"
+	Join OpType = "Join"
+	Leave OpType = "Leave"
+	Move OpType = "Move"
+)
+
+type CommandContext struct {
+	OpType
+	*CommandRequest
+	*CommandResponse
+}
+type CommandRequest struct {
+	OpType
+	ClientId int64
+	CommandId int64
+
+	Servers map[int][]string // new GID -> servers mappings
+	GIDs []int
+
+	Shard int
+	GID   int
+
+	Num int // desired config number
+}
+type CommandResponse struct {
+	WrongLeader bool
+	Err         Err
+	Config      Config
+}
+
+type Command struct {
+	*CommandRequest
 }

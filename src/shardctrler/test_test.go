@@ -12,6 +12,8 @@ import (
 func check(t *testing.T, groups []int, ck *Clerk) {
 	c := ck.Query(-1)
 	if len(c.Groups) != len(groups) {
+		DPrintf("c is %+v",c)
+		DPrintf("groups is %v",groups)
 		t.Fatalf("wanted %v groups, got %v", len(groups), len(c.Groups))
 	}
 
@@ -397,6 +399,7 @@ func TestMulti(t *testing.T) {
 	}
 
 	c1 = ck.Query(-1)
+
 	check_same_config(t, c, c1)
 
 	fmt.Printf("  ... Passed\n")
