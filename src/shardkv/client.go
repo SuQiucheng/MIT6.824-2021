@@ -93,7 +93,6 @@ func (ck *Clerk) PutAppend(key string, value string, op OpType) {
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	DPrintf("Put")
 	ck.PutAppend(key, value, Put)
 }
 func (ck *Clerk) Append(key string, value string) {
@@ -113,8 +112,8 @@ func (ck *Clerk) Command(request CommandRequest) CommandReply{
 				srv := ck.make_end(servers[si])
 				var reply CommandReply
 				ok := srv.Call("ShardKV.RequestHandle", &request, &reply)
-				DPrintf("reply is %v",reply)
-				if ok && (reply.Err == "" || reply.Err ==OK ||reply.Err == ErrNoKey){
+				DPrintf("reply is %+v",reply)
+				if ok && (reply.Err ==OK ||reply.Err == ErrNoKey){
 					ck.commandId+=1
 					return reply
 				}

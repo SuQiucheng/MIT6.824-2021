@@ -11,20 +11,39 @@ package shardkv
 
 const (
 	ConfigUpdateTimeout = 100
+	DataMigration = 50
 )
+type Err uint8
+
 const (
-	OK             Err = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
-	ErrTimeDesired = "ErrTimeDesired"
-	ErrConfiguration = "ErrConfiguration"
+	OK Err = iota
+	ErrNoKey
+	ErrWrongGroup
+	ErrWrongLeader
+	ErrTimeDesired
+	ErrConfiguration
 )
+func (e *Err) string() string{
+	switch *e {
+	case OK:
+		return "OK"
+	case ErrNoKey:
+		return "ErrNoKey"
+	case ErrWrongGroup:
+		return "ErrWrongGroup"
+	case ErrWrongLeader:
+		return "ErrWrongLeader"
+	case ErrTimeDesired:
+		return "ErrTimeDesired"
+	case ErrConfiguration:
+		return "ErrConfiguration"
+	}
+	return ""
+}
 
 const ExecuteTimeout = 100
 
 
-type Err string
 type OpType string
 type ConfigType string
 type ShardStatus int
@@ -82,17 +101,17 @@ type SKVStateMachine interface {
 }
 type Shards struct {
 	KVs map[string]string
-	status ShardStatus
+	Status ShardStatus
 }
 
 
 func MakeShards() *Shards  {
-	return &Shards{KVs: make(map[string]string),status: Serving}
+	return &Shards{KVs: make(map[string]string),Status: Serving}
 }
 
 func (s *Shards) Get(key string)(string,Err) {
 	if value, ok := s.KVs[key];ok {
-		return value,""
+		return value,OK
 	}
 	return "",ErrNoKey
 }
@@ -101,11 +120,25 @@ func (s *Shards) Put(key string,value string)Err {
 	return OK
 }
 func (s *Shards) Append(key string,value string)Err {
-	_, err := s.Get(key)
-	if err != "" {
-		s.KVs[key] = value
-	}else {
-		s.KVs[key] += value
-	}
+	s.KVs[key] += value
 	return OK
+}
+
+func (s *Shards) DeepCopy() *Shards {
+	newShards := MakeShards()
+	newShards.Status = s.Status
+	for key,value := range s.KVs{
+		newShards.KVs[key] = value
+	}
+	return newShards
+}
+
+type RequestShardsArgs struct {
+	ConfigNum int
+	Gid int
+	ShardsIndex []int
+}
+type RequestShardsReply struct {
+	Err
+	ShardsContent map[int]*Shards
 }

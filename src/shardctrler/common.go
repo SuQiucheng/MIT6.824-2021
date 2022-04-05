@@ -110,3 +110,7 @@ type CommandResponse struct {
 type Command struct {
 	*CommandRequest
 }
+
+func DefaultConfig() Config {
+	return Config{Groups: make(map[int][]string)}
+}

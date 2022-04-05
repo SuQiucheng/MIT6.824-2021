@@ -223,11 +223,6 @@ func (sc *ShardCtrler) Leave(command Command) Config {
 
 	leaveGIds := command.GIDs
 
-	for _,ele := range leaveGIds{
-		if ele==2 {
-			continue
-		}
-	}
 	restShards := make([]int,0)
 
 	config := Config{

@@ -27,6 +27,7 @@ type Op struct {
 	ConfigType
 	*CommandRequest
 	*ConfigurationChangeCommand
+	*InsertShardsCommand
 }
 
 type CommandContext struct {
@@ -38,6 +39,11 @@ type CommandContext struct {
 type ConfigurationChangeCommand struct {
 	//ToDo
 	Config *shardctrler.Config
+}
+
+type InsertShardsCommand struct {
+	ConfigNum int
+	ShardsContent map[int]*Shards
 }
 
 type ShardKV struct {
@@ -71,8 +77,9 @@ func (kv *ShardKV) RequestHandle(args *CommandRequest, reply *CommandReply) {
 	kv.mu.Lock()
 
 	shard := key2shard(args.Key)
-	DPrintf("RequestHandle:kv's config is %+v,request is %+v",kv.config,args)
+	DPrintf("[%d-%d]:RequestHandle:kv's config is %+v\n,request is %+v",kv.gid,kv.me,kv.config,args)
 	if !kv.canServe(shard){
+		DPrintf("[%d-%d]:kv.canServe false,shard GID ->kv GID is %v->%v,",kv.gid,kv.me,kv.config.Shards[shard],kv.gid)
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		return
@@ -142,10 +149,13 @@ func (kv *ShardKV) Applier() {
 				switch op.ConfigType {
 				case Operation:
 					args := op.CommandRequest
-					kv.applyOperation(args,reply)
+					kv.applyOperation(args, reply)
 				case Configuration:
 					args := op.ConfigurationChangeCommand
-					kv.applyConfiguration(args,reply)
+					kv.applyConfiguration(args, reply)
+				case InsertShards:
+					args := op.InsertShardsCommand
+					kv.applyInsertShards(args,reply)
 				}
 
 				if currentTerm,isLeader := kv.rf.GetState();currentTerm==message.CommandTerm&&isLeader{
@@ -164,9 +174,9 @@ func (kv *ShardKV) applyOperation(args *CommandRequest, reply *CommandReply) {
 	key := args.Key
 	shard := key2shard(key)
 
-	if _,ok := kv.sKVStateMachine[shard];!ok{
-		kv.sKVStateMachine[shard] = MakeShards()
-	}
+	//if _,ok := kv.sKVStateMachine[shard];!ok{
+	//	kv.sKVStateMachine[shard] = MakeShards()
+	//}
 
 	if kv.canServe(shard){
 		if kv.isDuplicated(args.ClientID,args.CommandId){
@@ -190,7 +200,7 @@ func (kv *ShardKV) applyOperation(args *CommandRequest, reply *CommandReply) {
 }
 
 func (kv *ShardKV) canServe(shard int)  bool{
-	return kv.config.Shards[shard]==kv.gid && (kv.sKVStateMachine[shard].status ==Serving ||kv.sKVStateMachine[shard].status ==Deleting)
+	return kv.config.Shards[shard]==kv.gid && (kv.sKVStateMachine[shard].Status ==Serving ||kv.sKVStateMachine[shard].Status ==Deleting)
 }
 
 
@@ -209,10 +219,108 @@ func (kv *ShardKV) PutAppend(args *CommandRequest, reply *CommandReply) {
 
 	switch args.OpType {
 	case Put:
+		DPrintf("[%d-%d]:PutAppend sKVStateMachine[%v]=%v",kv.gid,kv.me,shard,kv.sKVStateMachine[shard])
 		kv.sKVStateMachine[shard].Put(key,value)
 	case Append:
 		kv.sKVStateMachine[shard].Append(key,value)
 	}
+	DPrintf("[%d-%d]:After PutAppend,sKVStateMachine[%v]=%v",kv.gid,kv.me,shard,kv.sKVStateMachine[shard])
+}
+func (kv *ShardKV) DataMigration() {
+	for kv.Killed() == false {
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			kv.mu.Lock()
+			//gid:shards
+			needPull := map[int][]int{}
+			for shardIndex, shard := range kv.sKVStateMachine {
+				if shard.Status == Pulling {
+					DPrintf("[%d-%d]:shard{%v} is Pulling",kv.gid,kv.me,shardIndex)
+					lastGid := kv.lastConfig.Shards[shardIndex]
+					needPull[lastGid] = append(needPull[lastGid], shardIndex)
+				}
+			}
+			kv.mu.Unlock()
+			if len(needPull) != 0 {
+				DPrintf("[%d-%d]:need pull is %v,kv.lastConfig is %+v\nkv.Config is %+v",kv.gid,kv.me,needPull,kv.lastConfig,kv.config)
+			}
+			for key, value := range needPull {
+				if servers, ok := kv.lastConfig.Groups[key]; ok {
+					requestArgs := &RequestShardsArgs{
+						ConfigNum: kv.config.Num,
+						Gid:         key,
+						ShardsIndex: value,
+					}
+					var requestReply *RequestShardsReply
+					for si := 0; si < len(servers); si++ {
+						srv := kv.make_end(servers[si])
+						requestReply = new(RequestShardsReply)
+						ok := srv.Call("ShardKV.RequestShardsHandle", requestArgs, requestReply)
+						DPrintf("[%d-%d]:call is %v,requestReply is %+v",kv.gid,kv.me,ok,requestReply)
+						if ok && requestReply.Err == OK {
+							DPrintf("[%d-%d]:RequestShardsHandle Success,reply is %v",kv.gid,kv.me,requestReply)
+							insertShardsCommand := &InsertShardsCommand{requestArgs.ConfigNum,requestReply.ShardsContent}
+							op := Op{
+								ConfigType:                 InsertShards,
+								CommandRequest:             nil,
+								ConfigurationChangeCommand: nil,
+								InsertShardsCommand:        insertShardsCommand,
+							}
+							reply := new(CommandReply)
+							kv.SubmitToRaft(op, reply)
+						}
+					}
+				}
+			}
+		}
+		time.Sleep(DataMigration * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) RequestShardsHandle(args *RequestShardsArgs, reply *RequestShardsReply) {
+	_,isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err =ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if args.Gid != kv.gid{
+		reply.Err = ErrWrongGroup
+		return
+	}
+	if args.ConfigNum != kv.config.Num{
+		//DPrintf("[%d-%d]:kv.killed() = %v,args is %v,kv.config is %v",kv.gid,kv.me,kv.Killed(),args,kv.config)
+		reply.Err = ErrConfiguration
+		return
+	}
+	newShardsContent := map[int]*Shards{}
+	for _,shardIndex := range args.ShardsIndex{
+		newShardsContent[shardIndex] = kv.sKVStateMachine[shardIndex].DeepCopy()
+	}
+	reply.ShardsContent = newShardsContent
+	reply.Err = OK
+	DPrintf("[%d-%d]:RequestShardsHandle,args is %v,reply.ShardsContent is %v",kv.gid,kv.me,args,reply.ShardsContent)
+
+	return
+
+}
+
+func (kv *ShardKV) applyInsertShards(insertCommand *InsertShardsCommand,reply *CommandReply) {
+	DPrintf("[%d-%d]:applyInsertShards,args:%v",kv.gid,kv.me,insertCommand)
+	if insertCommand.ConfigNum != kv.config.Num{
+		reply.Err = ErrConfiguration
+		return
+	}
+	for shardIndex,shard := range insertCommand.ShardsContent{
+		//ToDo 修改为Deleting
+		shard.Status = Serving
+		DPrintf("[%d-%d]:shard status is serving,shard is %d-%v",kv.gid,kv.me,shardIndex,shard)
+		kv.sKVStateMachine[shardIndex] = shard
+	}
+	reply.Err = OK
+	return
+
 }
 
 func (kv *ShardKV) ConfigUpdate() {
@@ -220,7 +328,8 @@ func (kv *ShardKV) ConfigUpdate() {
 		canChangeConfiguration := true
 		kv.mu.Lock()
 		for _,shard := range kv.sKVStateMachine{
-			if shard.status!=Serving{
+			//ToDo delete state BePulling
+			if shard.Status!=Serving && shard.Status != BePulling{
 				canChangeConfiguration = false
 				break
 			}
@@ -228,6 +337,8 @@ func (kv *ShardKV) ConfigUpdate() {
 		lastConfig := kv.config
 
 		kv.mu.Unlock()
+		//DPrintf("[%d-%d]:更新状态：%v,kv.config is %v",kv.gid,kv.me,canChangeConfiguration,kv.config)
+
 		//DPrintf("%v 更新分片的状态",!canChangeConfiguration)
 		if canChangeConfiguration{
 			if _, isLeader := kv.rf.GetState();isLeader{
@@ -274,19 +385,20 @@ func (kv *ShardKV) updateShardsStatus(lastConfig, newConfig shardctrler.Config) 
 		if oldGID==0 && newGID == kv.gid{
 			if _,ok:=kv.sKVStateMachine[s];!ok{
 				kv.sKVStateMachine[s] = MakeShards()
+				//DPrintf("sKVStateMachine is %v",kv.sKVStateMachine)
 			}
 		}else if newGID==kv.gid && oldGID!=kv.gid{
 			if _,ok:=kv.sKVStateMachine[s];!ok{
 				kv.sKVStateMachine[s] = MakeShards()
 			}
 			//ToDo Pulling
-			//kv.sKVStateMachine[s].status = Pulling
+			kv.sKVStateMachine[s].Status = Pulling
 		}else if newGID!=kv.gid && oldGID==kv.gid{
 			if _,ok:=kv.sKVStateMachine[s];!ok{
 				kv.sKVStateMachine[s] = MakeShards()
 			}
 			//ToDo BePulling
-			//kv.sKVStateMachine[s].status = BePulling
+			kv.sKVStateMachine[s].Status = BePulling
 		}
 	}
 }
@@ -356,7 +468,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.lastContext = make(map[int64]*CommandContext)
 	kv.notifyChan = make(map[int]chan *CommandReply)
 	kv.sm = shardctrler.MakeClerk(ctrlers)
-
+	kv.config = shardctrler.DefaultConfig()
+	kv.lastConfig = shardctrler.DefaultConfig()
 
 	// Use something like this to talk to the shardctrler:
 	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
@@ -366,6 +479,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.sKVStateMachine = make(map[int]*Shards)
 	go kv.Applier()
 	go kv.ConfigUpdate()
+	go kv.DataMigration()
 
 
 	return kv
