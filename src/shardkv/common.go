@@ -10,8 +10,9 @@ package shardkv
 //
 
 const (
-	ConfigUpdateTimeout = 100
+	ConfigUpdateTimeout = 50
 	DataMigration = 50
+	DataDeleting = 50
 )
 type Err uint8
 

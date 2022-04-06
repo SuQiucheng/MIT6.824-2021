@@ -3,6 +3,7 @@ package shardkv
 import (
 	"6.824/labrpc"
 	"6.824/shardctrler"
+	"bytes"
 	"log"
 	"sync/atomic"
 	"time"
@@ -28,6 +29,7 @@ type Op struct {
 	*CommandRequest
 	*ConfigurationChangeCommand
 	*InsertShardsCommand
+	*DeleteShardsCommand
 }
 
 type CommandContext struct {
@@ -37,13 +39,17 @@ type CommandContext struct {
 }
 
 type ConfigurationChangeCommand struct {
-	//ToDo
 	Config *shardctrler.Config
 }
 
 type InsertShardsCommand struct {
 	ConfigNum int
 	ShardsContent map[int]*Shards
+}
+
+type DeleteShardsCommand struct {
+	ConfigNum int
+	ShardsIndex []int
 }
 
 type ShardKV struct {
@@ -64,12 +70,12 @@ type ShardKV struct {
 
 	dead int32
 	lastApplied int
-	lastContext map[int64]*CommandContext
+	lastApplyCommand map[int64]*CommandContext
 	notifyChan map[int]chan *CommandReply
 	sKVStateMachine map[int]*Shards
 }
 func (kv *ShardKV) isDuplicated(clientId int64, requestId int) bool {
-	context, ok := kv.lastContext[clientId]
+	context, ok := kv.lastApplyCommand[clientId]
 	return ok && requestId == context.CommandId
 }
 
@@ -87,7 +93,7 @@ func (kv *ShardKV) RequestHandle(args *CommandRequest, reply *CommandReply) {
 
 	//如果是上一次的command，那么就可以直接返回
 	if args.OpType != Get && kv.isDuplicated(args.ClientID,args.CommandId) {
-		reply = kv.lastContext[args.ClientID].CommandReply
+		reply = kv.lastApplyCommand[args.ClientID].CommandReply
 		kv.mu.Unlock()
 		return
 	}
@@ -156,13 +162,30 @@ func (kv *ShardKV) Applier() {
 				case InsertShards:
 					args := op.InsertShardsCommand
 					kv.applyInsertShards(args,reply)
+				case DeleteShards:
+					args := op.DeleteShardsCommand
+					kv.applyDeleteShards(args,reply)
 				}
 
 				if currentTerm,isLeader := kv.rf.GetState();currentTerm==message.CommandTerm&&isLeader{
 					kv.notifyChan[message.CommandIndex] <- reply
 				}
 				kv.lastApplied = message.CommandIndex
+				if kv.CheckSnapshot(){
+					kv.TakeSnapshot(kv.lastApplied)
+				}
 
+				kv.mu.Unlock()
+			}else if message.SnapshotValid{
+				kv.mu.Lock()
+				if message.SnapshotIndex<=kv.lastApplied{
+					kv.mu.Unlock()
+					continue
+				}
+				//这个是恢复上层应用的快照
+				kv.RestoreSnapshot(message.Snapshot)
+				//这个是恢复下层raft的state，将它的Term、Index都重新设置
+				kv.rf.CondInstallSnapshot(message.SnapshotTerm,message.SnapshotIndex,message.Snapshot)
 				kv.mu.Unlock()
 			}
 		}
@@ -180,7 +203,7 @@ func (kv *ShardKV) applyOperation(args *CommandRequest, reply *CommandReply) {
 
 	if kv.canServe(shard){
 		if kv.isDuplicated(args.ClientID,args.CommandId){
-			reply = kv.lastContext[args.ClientID].CommandReply
+			reply = kv.lastApplyCommand[args.ClientID].CommandReply
 			return
 		}else {
 			switch args.OpType {
@@ -190,7 +213,7 @@ func (kv *ShardKV) applyOperation(args *CommandRequest, reply *CommandReply) {
 				fallthrough
 			case Append:
 				kv.PutAppend(args,reply)
-				kv.lastContext[args.ClientID] = &CommandContext{Operation,args.CommandId,reply}
+				kv.lastApplyCommand[args.ClientID] = &CommandContext{Operation,args.CommandId,reply}
 			}
 		}
 	}else {
@@ -255,7 +278,7 @@ func (kv *ShardKV) DataMigration() {
 						srv := kv.make_end(servers[si])
 						requestReply = new(RequestShardsReply)
 						ok := srv.Call("ShardKV.RequestShardsHandle", requestArgs, requestReply)
-						DPrintf("[%d-%d]:call is %v,requestReply is %+v",kv.gid,kv.me,ok,requestReply)
+						DPrintf("[%d-%d]:RequestShardsHandle call is %v,requestReply is %+v",kv.gid,kv.me,ok,requestReply)
 						if ok && requestReply.Err == OK {
 							DPrintf("[%d-%d]:RequestShardsHandle Success,reply is %v",kv.gid,kv.me,requestReply)
 							insertShardsCommand := &InsertShardsCommand{requestArgs.ConfigNum,requestReply.ShardsContent}
@@ -313,10 +336,12 @@ func (kv *ShardKV) applyInsertShards(insertCommand *InsertShardsCommand,reply *C
 		return
 	}
 	for shardIndex,shard := range insertCommand.ShardsContent{
-		//ToDo 修改为Deleting
-		shard.Status = Serving
-		DPrintf("[%d-%d]:shard status is serving,shard is %d-%v",kv.gid,kv.me,shardIndex,shard)
+		shard.Status = Deleting
+		DPrintf("[%d-%d]:shard status is Deleting,shard is %d-%v",kv.gid,kv.me,shardIndex,shard)
 		kv.sKVStateMachine[shardIndex] = shard
+	}
+	for ele := range kv.sKVStateMachine{
+		DPrintf("[%d-%d]:After applyInsertShards,shard[%d] is %+v",kv.gid,kv.me,ele,kv.sKVStateMachine[ele])
 	}
 	reply.Err = OK
 	return
@@ -329,15 +354,15 @@ func (kv *ShardKV) ConfigUpdate() {
 		kv.mu.Lock()
 		for _,shard := range kv.sKVStateMachine{
 			//ToDo delete state BePulling
-			if shard.Status!=Serving && shard.Status != BePulling{
+			if shard.Status!=Serving{
 				canChangeConfiguration = false
 				break
 			}
 		}
 		lastConfig := kv.config
 
+		DPrintf("[%d-%d]:更新状态：%v,kv.config is %v",kv.gid,kv.me,canChangeConfiguration,kv.config)
 		kv.mu.Unlock()
-		//DPrintf("[%d-%d]:更新状态：%v,kv.config is %v",kv.gid,kv.me,canChangeConfiguration,kv.config)
 
 		//DPrintf("%v 更新分片的状态",!canChangeConfiguration)
 		if canChangeConfiguration{
@@ -362,6 +387,7 @@ func (kv *ShardKV) ConfigUpdate() {
 }
 func (kv *ShardKV) applyConfiguration(cfChangeCommand *ConfigurationChangeCommand,reply *CommandReply) {
 	cf := cfChangeCommand.Config
+	DPrintf("[%d-%d]:applyConfiguration,kv.config is %v,config is %v",kv.gid,kv.me,kv.config,cf)
 	// 对于状态机来说，如果这个config不是上一个config的下一个，那么就不能更新
 	if cf.Num == kv.config.Num+1{
 		kv.updateShardsStatus(kv.config,*cf)
@@ -391,16 +417,123 @@ func (kv *ShardKV) updateShardsStatus(lastConfig, newConfig shardctrler.Config) 
 			if _,ok:=kv.sKVStateMachine[s];!ok{
 				kv.sKVStateMachine[s] = MakeShards()
 			}
-			//ToDo Pulling
 			kv.sKVStateMachine[s].Status = Pulling
 		}else if newGID!=kv.gid && oldGID==kv.gid{
 			if _,ok:=kv.sKVStateMachine[s];!ok{
 				kv.sKVStateMachine[s] = MakeShards()
 			}
-			//ToDo BePulling
 			kv.sKVStateMachine[s].Status = BePulling
 		}
 	}
+}
+
+func (kv *ShardKV) DataDeleting()  {
+	for kv.Killed() == false{
+		if _,isLeader := kv.rf.GetState();isLeader{
+			kv.mu.Lock()
+			//gid:shards
+			needDelete := map[int][]int{}
+			for shardIndex,shard := range kv.sKVStateMachine{
+				if shard.Status == Deleting{
+					DPrintf("[%d-%d]:shard{%v} is Deleting",kv.gid,kv.me,shardIndex)
+					lastGid := kv.lastConfig.Shards[shardIndex]
+					needDelete[lastGid] = append(needDelete[lastGid],shardIndex)
+				}
+			}
+			kv.mu.Unlock()
+			if len(needDelete) != 0 {
+				DPrintf("[%d-%d]:need delete is %v,kv.lastConfig is %+v\nkv.Config is %+v",kv.gid,kv.me,needDelete,kv.lastConfig,kv.config)
+			}
+			for key,value := range needDelete{
+				if servers,ok := kv.lastConfig.Groups[key];ok{
+					requestArgs := &RequestShardsArgs{
+						ConfigNum: kv.config.Num,
+						Gid:         key,
+						ShardsIndex: value,
+					}
+					var requestReply *RequestShardsReply
+					for si := 0;si<len(servers);si++{
+						srv := kv.make_end(servers[si])
+						requestReply = new(RequestShardsReply)
+						ok := srv.Call("ShardKV.RequestDeleteShardsHandle", requestArgs, requestReply)
+						DPrintf("[%d-%d]:RequestDeleteShardsHandle call is %v,requestReply is %+v",kv.gid,kv.me,ok,requestReply)
+						if ok && requestReply.Err == OK{
+							deleteShardsCommand := &DeleteShardsCommand{
+								ConfigNum:   requestArgs.ConfigNum,
+								ShardsIndex: requestArgs.ShardsIndex,
+							}
+							op := Op{
+								ConfigType:                 DeleteShards,
+								CommandRequest:             nil,
+								ConfigurationChangeCommand: nil,
+								InsertShardsCommand:        nil,
+								DeleteShardsCommand:        deleteShardsCommand,
+							}
+							reply := new(CommandReply)
+							kv.SubmitToRaft(op,reply)
+						}
+					}
+				}
+			}
+		}
+		time.Sleep(DataDeleting*time.Microsecond)
+	}
+}
+func (kv *ShardKV) applyDeleteShards(deleteCommand *DeleteShardsCommand, reply *CommandReply) {
+	DPrintf("[%d-%d]:applyDeleteShards,deleteCommand is %v,kv.config is %v",kv.gid,kv.me,deleteCommand,kv.config)
+
+	if deleteCommand.ConfigNum != kv.config.Num{
+		reply.Err = ErrConfiguration
+		return
+	}
+	for _,shardIndex := range deleteCommand.ShardsIndex{
+		shard := kv.sKVStateMachine[shardIndex]
+		if shard.Status == Deleting{
+			kv.sKVStateMachine[shardIndex].Status = Serving
+		}else if shard.Status == BePulling{
+			kv.sKVStateMachine[shardIndex] = MakeShards()
+		}
+	}
+	DPrintf("[%d-%d]:applyDeleteShards Success!",kv.gid,kv.me)
+	reply.Err= OK
+	return
+
+}
+
+func (kv *ShardKV) RequestDeleteShardsHandle(args *RequestShardsArgs, reply *RequestShardsReply) {
+	_,isLeader := kv.rf.GetState()
+	if !isLeader{
+		reply.Err = ErrWrongLeader
+		return
+	}
+	kv.mu.Lock()
+	if args.Gid!=kv.gid{
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	if args.ConfigNum < kv.config.Num{
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+	//leader删除之后，需要将删除的这个log发送到follower上
+	deleteShardsCommand := &DeleteShardsCommand{
+		ConfigNum:   args.ConfigNum,
+		ShardsIndex: args.ShardsIndex,
+	}
+	op := Op{
+		ConfigType:                 DeleteShards,
+		CommandRequest:             nil,
+		ConfigurationChangeCommand: nil,
+		InsertShardsCommand:        nil,
+		DeleteShardsCommand:        deleteShardsCommand,
+	}
+	commandReply := new(CommandReply)
+	kv.SubmitToRaft(op,commandReply)
+	reply.Err = commandReply.Err
+	return
 }
 //
 // the tester calls Kill() when a ShardKV instance won't
@@ -417,6 +550,46 @@ func (kv *ShardKV) Kill() {
 func (kv *ShardKV) Killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z==1
+}
+
+func (kv *ShardKV) CheckSnapshot() bool {
+	if kv.maxraftstate!=-1 && kv.rf.GetRaftStateSize() >= kv.maxraftstate{
+		return true
+	}
+	return false
+}
+
+func (kv *ShardKV) TakeSnapshot(index int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.lastApplyCommand)
+	e.Encode(kv.sKVStateMachine)
+	e.Encode(kv.config)
+	e.Encode(kv.lastConfig)
+	data := w.Bytes()
+	kv.rf.Snapshot(index,data)
+}
+
+func (kv *ShardKV) RestoreSnapshot(snapshot []byte) {
+	if snapshot==nil || len(snapshot)==0{
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var lastApplyCommand map[int64]*CommandContext
+	var sKVStateMachine map[int]*Shards
+	var config shardctrler.Config
+	var lastConfig shardctrler.Config
+
+	if d.Decode(&lastApplyCommand) != nil || d.Decode(&sKVStateMachine) != nil ||d.Decode(&config)!=nil||d.Decode(&lastConfig)!=nil{
+		DPrintf("读取持久化错误！")
+	}
+	kv.lastApplyCommand = lastApplyCommand
+	kv.sKVStateMachine = sKVStateMachine
+	kv.config = config
+	kv.lastConfig = lastConfig
+	DPrintf("RestoreSnapshot finished!lastApplyCommand:%+v,sKVStateMachine:%+v",lastApplyCommand,sKVStateMachine)
+
 }
 
 
@@ -465,7 +638,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.dead = 0
 	kv.lastApplied = 0
-	kv.lastContext = make(map[int64]*CommandContext)
+	kv.lastApplyCommand = make(map[int64]*CommandContext)
 	kv.notifyChan = make(map[int]chan *CommandReply)
 	kv.sm = shardctrler.MakeClerk(ctrlers)
 	kv.config = shardctrler.DefaultConfig()
@@ -477,9 +650,12 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.sKVStateMachine = make(map[int]*Shards)
+
+	kv.RestoreSnapshot(persister.ReadSnapshot())
 	go kv.Applier()
 	go kv.ConfigUpdate()
 	go kv.DataMigration()
+	go kv.DataDeleting()
 
 
 	return kv
