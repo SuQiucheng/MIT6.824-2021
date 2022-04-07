@@ -44,7 +44,7 @@ type ConfigurationChangeCommand struct {
 
 type InsertShardsCommand struct {
 	ConfigNum int
-	ShardsContent map[int]*Shards
+	ShardsContent map[int]Shards
 }
 
 type DeleteShardsCommand struct {
@@ -280,8 +280,12 @@ func (kv *ShardKV) DataMigration() {
 						ok := srv.Call("ShardKV.RequestShardsHandle", requestArgs, requestReply)
 						DPrintf("[%d-%d]:RequestShardsHandle call is %v,requestReply is %+v",kv.gid,kv.me,ok,requestReply)
 						if ok && requestReply.Err == OK {
-							DPrintf("[%d-%d]:RequestShardsHandle Success,reply is %v",kv.gid,kv.me,requestReply)
-							insertShardsCommand := &InsertShardsCommand{requestArgs.ConfigNum,requestReply.ShardsContent}
+							//DPrintf("[%d-%d]:RequestShardsHandle Success,reply is %v",kv.gid,kv.me,requestReply)
+							shardsContent := map[int]Shards{}
+							for shardId,shard := range requestReply.ShardsContent{
+								shardsContent[shardId] = *shard
+							}
+							insertShardsCommand := &InsertShardsCommand{requestArgs.ConfigNum,shardsContent}
 							op := Op{
 								ConfigType:                 InsertShards,
 								CommandRequest:             nil,
@@ -338,7 +342,7 @@ func (kv *ShardKV) applyInsertShards(insertCommand *InsertShardsCommand,reply *C
 	for shardIndex,shard := range insertCommand.ShardsContent{
 		shard.Status = Deleting
 		DPrintf("[%d-%d]:shard status is Deleting,shard is %d-%v",kv.gid,kv.me,shardIndex,shard)
-		kv.sKVStateMachine[shardIndex] = shard
+		kv.sKVStateMachine[shardIndex] = (&shard).DeepCopy()
 	}
 	for ele := range kv.sKVStateMachine{
 		DPrintf("[%d-%d]:After applyInsertShards,shard[%d] is %+v",kv.gid,kv.me,ele,kv.sKVStateMachine[ele])
@@ -441,9 +445,9 @@ func (kv *ShardKV) DataDeleting()  {
 				}
 			}
 			kv.mu.Unlock()
-			if len(needDelete) != 0 {
-				DPrintf("[%d-%d]:need delete is %v,kv.lastConfig is %+v\nkv.Config is %+v",kv.gid,kv.me,needDelete,kv.lastConfig,kv.config)
-			}
+			//if len(needDelete) != 0 {
+			//	DPrintf("[%d-%d]:need delete is %v,kv.lastConfig is %+v\nkv.Config is %+v",kv.gid,kv.me,needDelete,kv.lastConfig,kv.config)
+			//}
 			for key,value := range needDelete{
 				if servers,ok := kv.lastConfig.Groups[key];ok{
 					requestArgs := &RequestShardsArgs{
