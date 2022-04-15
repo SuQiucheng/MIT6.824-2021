@@ -71,7 +71,6 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	DPrintf("Get")
 	args := CommandRequest{}
 	args.Key = key
 	args.OpType = Get
@@ -96,7 +95,6 @@ func (ck *Clerk) Put(key string, value string) {
 	ck.PutAppend(key, value, Put)
 }
 func (ck *Clerk) Append(key string, value string) {
-	DPrintf("Append")
 	ck.PutAppend(key, value, Append)
 }
 func (ck *Clerk) Command(request CommandRequest) CommandReply{
@@ -106,13 +104,12 @@ func (ck *Clerk) Command(request CommandRequest) CommandReply{
 	for {
 		shard := key2shard(request.Key)
 		gid := ck.config.Shards[shard]
-		DPrintf("%s 's gid is %d",request.OpType,gid)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply CommandReply
 				ok := srv.Call("ShardKV.RequestHandle", &request, &reply)
-				DPrintf("reply is %+v",reply)
+				//DPrintf("gid is %d,client is %d,request is %+v,reply is %+v",gid,si,request,reply)
 				if ok && (reply.Err ==OK ||reply.Err == ErrNoKey){
 					ck.commandId+=1
 					return reply
@@ -120,7 +117,6 @@ func (ck *Clerk) Command(request CommandRequest) CommandReply{
 				if ok && reply.Err == ErrWrongGroup {
 					break
 				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)

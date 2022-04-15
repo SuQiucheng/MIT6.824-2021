@@ -494,19 +494,24 @@ func TestConcurrent3(t *testing.T) {
 		cfg.join(2)
 		cfg.join(1)
 		time.Sleep(time.Duration(rand.Int()%900) * time.Millisecond)
+		DPrintf("ShutdownGroup")
 		cfg.ShutdownGroup(0)
 		cfg.ShutdownGroup(1)
 		cfg.ShutdownGroup(2)
+		DPrintf("StartGroup")
 		cfg.StartGroup(0)
 		cfg.StartGroup(1)
 		cfg.StartGroup(2)
 
 		time.Sleep(time.Duration(rand.Int()%900) * time.Millisecond)
 		cfg.leave(1)
+		DPrintf("leave 1")
 		cfg.leave(2)
+		DPrintf("leave 2")
+
 		time.Sleep(time.Duration(rand.Int()%900) * time.Millisecond)
 	}
-
+	DPrintf("关闭重启结束")
 	time.Sleep(2 * time.Second)
 
 	atomic.StoreInt32(&done, 1)

@@ -13,6 +13,7 @@ const (
 	ConfigUpdateTimeout = 50
 	DataMigration = 50
 	DataDeleting = 50
+	EmptyLogCheck = 50
 )
 type Err uint8
 
@@ -68,6 +69,7 @@ const (
 	Configuration = "Configuration"
 	InsertShards = "InsertShards"
 	DeleteShards = "DeleteShards"
+	EmptyLogOpera = "EmptyLog"
 )
 const (
 	Put OpType = "Put"
@@ -142,4 +144,5 @@ type RequestShardsArgs struct {
 type RequestShardsReply struct {
 	Err
 	ShardsContent map[int]*Shards
+	ShardsLastOperation map[int64]*CommandContext
 }
