@@ -189,6 +189,11 @@ func (rf *Raft) persist() {
 func (rf *Raft) GetRaftStateSize() int {
 	return rf.persister.RaftStateSize()
 }
+func (rf *Raft) HasLogInCurrentTerm() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.GetLastLog().Term == rf.currentTerm
+}
 
 //
 // restore previously persisted state.
